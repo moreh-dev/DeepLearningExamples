@@ -56,6 +56,8 @@ amp.lists.functional_overrides.FP32_FUNCS.remove('softmax')
 amp.lists.functional_overrides.FP16_FUNCS.append('softmax')
 
 
+torch.manual_seed(1)
+
 def parse_args(parser):
     """
     Parse commandline arguments.

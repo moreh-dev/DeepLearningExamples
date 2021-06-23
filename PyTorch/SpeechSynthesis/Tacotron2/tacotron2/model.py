@@ -126,7 +126,8 @@ class Prenet(nn.Module):
 
     def forward(self, x):
         for linear in self.layers:
-            x = F.dropout(F.relu(linear(x)), p=0.5, training=True)
+            # x = F.dropout(F.relu(linear(x)), p=0.5, training=True)
+            x = F.dropout(F.relu(linear(x)), p=0.0, training=True)
         return x
 
 
@@ -174,9 +175,13 @@ class Postnet(nn.Module):
         i = 0
         for conv in self.convolutions:
             if i < self.n_convs - 1:
-                x = F.dropout(torch.tanh(conv(x)), 0.5, training=self.training)
+                # x = F.dropout(torch.tanh(conv(x)), 0.5, training=self.training)
+                x = F.dropout(torch.tanh(conv(x)), 0.0, training=self.training)
+                
             else:
-                x = F.dropout(conv(x), 0.5, training=self.training)
+                # x = F.dropout(conv(x), 0.5, training=self.training)
+                x = F.dropout(conv(x), 0.0, training=self.training)
+                
             i += 1
 
         return x
@@ -209,21 +214,22 @@ class Encoder(nn.Module):
 
     @torch.jit.ignore
     def forward(self, x, input_lengths):
-        for conv in self.convolutions:
-            x = F.dropout(F.relu(conv(x)), 0.5, self.training)
+        #for conv in self.convolutions:
+        for i, conv in enumerate(self.convolutions):
+            # x = F.dropout(F.relu(conv(x)), 0.5, self.training)
+            x = F.dropout(F.relu(conv(x)), 0.0, self.training)
 
         x = x.transpose(1, 2)
 
         # pytorch tensor are not reversible, hence the conversion
         input_lengths = input_lengths.cpu().numpy()
-        x = nn.utils.rnn.pack_padded_sequence(
-            x, input_lengths, batch_first=True)
+        # x = nn.utils.rnn.pack_padded_sequence(
+        #     x, input_lengths, batch_first=True)
 
         self.lstm.flatten_parameters()
         outputs, _ = self.lstm(x)
-
-        outputs, _ = nn.utils.rnn.pad_packed_sequence(
-            outputs, batch_first=True)
+        # outputs, _ = nn.utils.rnn.pad_packed_sequence(
+        #     outputs, batch_first=True)
 
         return outputs
 
@@ -231,7 +237,8 @@ class Encoder(nn.Module):
     def infer(self, x, input_lengths):
         device = x.device
         for conv in self.convolutions:
-            x = F.dropout(F.relu(conv(x.to(device))), 0.5, self.training)
+            # x = F.dropout(F.relu(conv(x.to(device))), 0.5, self.training)
+            x = F.dropout(F.relu(conv(x.to(device))), 0.0, self.training)
 
         x = x.transpose(1, 2)
 
@@ -661,7 +668,7 @@ class Tacotron2(nn.Module):
         input_lengths, output_lengths = input_lengths.data, output_lengths.data
 
         embedded_inputs = self.embedding(inputs).transpose(1, 2)
-
+        
         encoder_outputs = self.encoder(embedded_inputs, input_lengths)
 
         mel_outputs, gate_outputs, alignments = self.decoder(
