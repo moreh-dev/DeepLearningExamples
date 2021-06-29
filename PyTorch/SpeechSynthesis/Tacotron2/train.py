@@ -55,6 +55,7 @@ from apex import amp
 amp.lists.functional_overrides.FP32_FUNCS.remove('softmax')
 amp.lists.functional_overrides.FP16_FUNCS.append('softmax')
 
+from monitor import connect, notify
 
 torch.manual_seed(1)
 
@@ -75,9 +76,14 @@ def parse_args(parser):
                         help='Epochs after which decrease learning rate')
     parser.add_argument('--anneal-factor', type=float, choices=[0.1, 0.3], default=0.1,
                         help='Factor for annealing learning rate')
-
     parser.add_argument('--config-file', action=ParseFromConfigFile,
                          type=str, help='Path to configuration file')
+    parser.add_argument('--enable-integration-test', action='store_true', default=False,
+                        help='report results to an integration test server')
+    parser.add_argument('--testserver-ip', default='localhost',
+                        help='Host for integration test server (default: localhost)')
+    parser.add_argument('--testserver-port', type=int, default=37881,
+                        help='Port for integration test server (default: 37881)')
 
     # training
     training = parser.add_argument_group('training setup')
@@ -453,6 +459,9 @@ def main():
 
     model.train()
 
+    if args.enable_integration_test:
+        connect(args)
+
     for epoch in range(start_epoch, args.epochs):
         torch.cuda.synchronize()
         epoch_start_time = time.perf_counter()
@@ -521,6 +530,7 @@ def main():
 
             DLLogger.log(step=(epoch, i), data={'train_items_per_sec': items_per_sec})
             DLLogger.log(step=(epoch, i), data={'train_iter_time': iter_time})
+            notify(i, reduced_loss, items_per_sec, args)
             iteration += 1
 
         torch.cuda.synchronize()
