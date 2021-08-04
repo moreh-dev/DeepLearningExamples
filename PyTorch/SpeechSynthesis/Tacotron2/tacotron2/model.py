@@ -33,8 +33,8 @@ import sys
 from os.path import abspath, dirname
 # enabling modules discovery from global entrypoint
 sys.path.append(abspath(dirname(__file__)+'/../'))
-from tacotron2_common.layers import ConvNorm, LinearNorm
-from tacotron2_common.utils import to_gpu, get_mask_from_lengths
+from common.layers import ConvNorm, LinearNorm
+from common.utils import to_gpu, get_mask_from_lengths
 
 
 class LocationLayer(nn.Module):
@@ -206,6 +206,7 @@ class Encoder(nn.Module):
         self.lstm = nn.LSTM(encoder_embedding_dim,
                             int(encoder_embedding_dim / 2), 1,
                             batch_first=True, bidirectional=True)
+        self.encoder_embedding_dim = encoder_embedding_dim
 
     @torch.jit.ignore
     def forward(self, x, input_lengths):
@@ -216,14 +217,26 @@ class Encoder(nn.Module):
 
         # pytorch tensor are not reversible, hence the conversion
         input_lengths = input_lengths.cpu().numpy()
-        x = nn.utils.rnn.pack_padded_sequence(
-            x, input_lengths, batch_first=True)
+        #x = nn.utils.rnn.pack_padded_sequence(
+        #    x, input_lengths, batch_first=True)
 
         self.lstm.flatten_parameters()
-        outputs, _ = self.lstm(x)
 
-        outputs, _ = nn.utils.rnn.pad_packed_sequence(
-            outputs, batch_first=True)
+        hx = torch.zeros(x.shape[0], 2, int(self.encoder_embedding_dim / 2))
+        cx = torch.zeros(x.shape[0], 2, int(self.encoder_embedding_dim / 2))
+        hx = hx.to('cuda')
+        cx = cx.to('cuda')
+        hx.requires_grad = True
+        cx.requires_grad = True
+        hx = hx.transpose(0, 1)
+        cx = cx.transpose(0, 1)
+
+        outputs, _ = self.lstm(x, (hx, cx))
+
+        #outputs, _ = nn.utils.rnn.pad_packed_sequence(
+        #    outputs, batch_first=True)
+
+        #print('## lstm outputs:', outputs)
 
         return outputs
 
@@ -366,7 +379,7 @@ class Decoder(nn.Module):
             decoder_inputs.size(0),
             int(decoder_inputs.size(1)/self.n_frames_per_step), -1)
         # (B, T_out, n_mel_channels) -> (T_out, B, n_mel_channels)
-        decoder_inputs = decoder_inputs.transpose(0, 1)
+        #decoder_inputs = decoder_inputs.transpose(0, 1)
         return decoder_inputs
 
     def parse_decoder_outputs(self, mel_outputs, gate_outputs, alignments):
@@ -384,23 +397,28 @@ class Decoder(nn.Module):
         alignments:
         """
         # (T_out, B) -> (B, T_out)
-        alignments = alignments.transpose(0, 1).contiguous()
+        #alignments = alignments.transpose(0, 1).contiguous()
         # (T_out, B) -> (B, T_out)
-        gate_outputs = gate_outputs.transpose(0, 1).contiguous()
+        #gate_outputs = gate_outputs.transpose(0, 1).contiguous()
         # (T_out, B, n_mel_channels) -> (B, T_out, n_mel_channels)
-        mel_outputs = mel_outputs.transpose(0, 1).contiguous()
+        #mel_outputs = mel_outputs.transpose(0, 1).contiguous()
         # decouple frames per step
         shape = (mel_outputs.shape[0], -1, self.n_mel_channels)
         mel_outputs = mel_outputs.view(*shape)
         # (B, T_out, n_mel_channels) -> (B, n_mel_channels, T_out)
         mel_outputs = mel_outputs.transpose(1, 2)
 
+        #print('## parse_decoder_outputs')
+        #print(mel_outputs.shape)
+        #print(gate_outputs.shape)
+        #print(alignments.shape)
+
         return mel_outputs, gate_outputs, alignments
 
     def decode(self, decoder_input, attention_hidden, attention_cell,
                decoder_hidden, decoder_cell, attention_weights,
                attention_weights_cum, attention_context, memory,
-               processed_memory, mask):
+               processed_memory, mask, n):
         """ Decoder step using stored states, attention and memory
         PARAMS
         ------
@@ -413,9 +431,18 @@ class Decoder(nn.Module):
         attention_weights:
         """
         cell_input = torch.cat((decoder_input, attention_context), -1)
+        #print('# cell_input:\n', cell_input)
+        #print('# attention_hidden:\n', attention_hidden, attention_hidden.shape)
+        #print('# attention_cell:\n', attention_cell, attention_cell.shape)
+
+        attention_hidden.requires_grad=True
+        attention_cell.requires_grad=True
 
         attention_hidden, attention_cell = self.attention_rnn(
             cell_input, (attention_hidden, attention_cell))
+        #print('# attention_hidden:\n', attention_hidden, attention_hidden.shape)
+        #print('# attention_cell:\n', attention_cell, attention_cell.shape)
+
         attention_hidden = F.dropout(
             attention_hidden, self.p_attention_dropout, self.training)
 
@@ -429,6 +456,9 @@ class Decoder(nn.Module):
         attention_weights_cum += attention_weights
         decoder_input = torch.cat(
             (attention_hidden, attention_context), -1)
+
+        decoder_hidden.requires_grad=True
+        decoder_cell.requires_grad=True
 
         decoder_hidden, decoder_cell = self.decoder_rnn(
             decoder_input, (decoder_hidden, decoder_cell))
@@ -462,9 +492,10 @@ class Decoder(nn.Module):
         alignments: sequence of attention weights from the decoder
         """
 
-        decoder_input = self.get_go_frame(memory).unsqueeze(0)
+        #B, 1, T
+        decoder_input = self.get_go_frame(memory).unsqueeze(1)
         decoder_inputs = self.parse_decoder_inputs(decoder_inputs)
-        decoder_inputs = torch.cat((decoder_input, decoder_inputs), dim=0)
+        decoder_inputs = torch.cat((decoder_input, decoder_inputs), dim=1)
         decoder_inputs = self.prenet(decoder_inputs)
 
         mask = get_mask_from_lengths(memory_lengths)
@@ -477,9 +508,23 @@ class Decoder(nn.Module):
          attention_context,
          processed_memory) = self.initialize_decoder_states(memory)
 
-        mel_outputs, gate_outputs, alignments = [], [], []
-        while len(mel_outputs) < decoder_inputs.size(0) - 1:
-            decoder_input = decoder_inputs[len(mel_outputs)]
+        #print(attention_context, attention_context.shape)
+
+        n = 0
+        first_iter = True
+        mel_outputs = [] 
+        gate_outputs = []
+        alignments = [] 
+        while n < decoder_inputs.size(1) - 1:
+            #shape = decoder_inputs.shape
+            #print('shape = ', shape)
+            #print('stride = ', decoder_inputs.stride())
+            index = torch.tensor([n])
+            index = index.to('cuda')
+            decoder_input = torch.index_select(decoder_inputs, 1, index)
+            decoder_input = decoder_input.squeeze(1)
+            #decoder_input = decoder_inputs.view(
+            #        shape[0] * shape[1], shape[2])[n::shape[1]]
             (mel_output,
              gate_output,
              attention_hidden,
@@ -498,18 +543,27 @@ class Decoder(nn.Module):
                                               attention_context,
                                               memory,
                                               processed_memory,
-                                              mask)
+                                              mask, n)
 
-            mel_outputs += [mel_output.squeeze(1)]
-            gate_outputs += [gate_output.squeeze()]
-            alignments += [attention_weights]
+            mel_output = mel_output.squeeze(1)
+            gate_output = gate_output.squeeze()
 
-        mel_outputs, gate_outputs, alignments = self.parse_decoder_outputs(
-            torch.stack(mel_outputs),
-            torch.stack(gate_outputs),
-            torch.stack(alignments))
+            gate_output = gate_output.unsqueeze(1)
 
-        return mel_outputs, gate_outputs, alignments
+            mel_outputs.append(mel_output)
+            gate_outputs.append(gate_output)
+            alignments.append(attention_weights.unsqueeze(1))
+            n = n + 1
+        mel_outputs_= torch.cat(mel_outputs, dim = 1)
+        gate_outputs_= torch.cat(gate_outputs, dim = 1)
+        alignments_= torch.cat(alignments, dim = 1)
+        #print(alignments_.shape)
+        #print(alignments[0].shape)
+
+        mel_outputs_, gate_outputs_, alignments_ = self.parse_decoder_outputs(
+            mel_outputs_, gate_outputs_, alignments_)
+
+        return mel_outputs_, gate_outputs_, alignments_
 
     @torch.jit.export
     def infer(self, memory, memory_lengths):
@@ -657,8 +711,11 @@ class Tacotron2(nn.Module):
         return outputs
 
     def forward(self, inputs):
+        #print('## Tacotron2.forward')
         inputs, input_lengths, targets, max_len, output_lengths = inputs
-        input_lengths, output_lengths = input_lengths.data, output_lengths.data
+        #input_lengths, output_lengths = input_lengths.data, output_lengths.data
+        input_lengths = input_lengths.detach()
+        output_lengths = output_lengths.detach()
 
         embedded_inputs = self.embedding(inputs).transpose(1, 2)
 
