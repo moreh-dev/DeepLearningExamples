@@ -55,9 +55,20 @@ from apex import amp
 amp.lists.functional_overrides.FP32_FUNCS.remove('softmax')
 amp.lists.functional_overrides.FP16_FUNCS.append('softmax')
 
-from monitor import connect, notify
 
-torch.manual_seed(1)
+from modeltests import ReportClient
+reporter = None
+
+
+import random
+random_seed = 1
+torch.manual_seed(random_seed)
+torch.cuda.manual_seed(random_seed)
+torch.cuda.manual_seed_all(random_seed) # if use multi-GPU
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+np.random.seed(random_seed)
+random.seed(random_seed)
 
 def parse_args(parser):
     """
@@ -78,7 +89,7 @@ def parse_args(parser):
                         help='Factor for annealing learning rate')
     parser.add_argument('--config-file', action=ParseFromConfigFile,
                          type=str, help='Path to configuration file')
-    parser.add_argument('--enable-integration-test', action='store_true', default=False,
+    parser.add_argument('--enable-modeltests', action='store_true', default=False,
                         help='report results to an integration test server')
     parser.add_argument('--testserver-ip', default='localhost',
                         help='Host for integration test server (default: localhost)')
@@ -292,7 +303,7 @@ def validate(model, criterion, valset, epoch, batch_iter, batch_size,
     """Handles all the validation scoring and printing"""
     with evaluating(model), torch.no_grad():
         val_sampler = DistributedSampler(valset) if distributed_run else None
-        val_loader = DataLoader(valset, num_workers=1, shuffle=False,
+        val_loader = DataLoader(valset, num_workers=0, shuffle=False,
                                 sampler=val_sampler,
                                 batch_size=batch_size, pin_memory=False,
                                 collate_fn=collate_fn)
@@ -329,6 +340,7 @@ def validate(model, criterion, valset, epoch, batch_iter, batch_size,
         DLLogger.log(step=(epoch,), data={'val_loss': val_loss})
         DLLogger.log(step=(epoch,), data={'val_items_per_sec':
                                          (val_items_per_sec/num_iters if num_iters > 0 else 0.0)})
+        DLLogger.flush()
 
         return val_loss, val_items_per_sec
 
@@ -442,7 +454,7 @@ def main():
         train_sampler = None
         shuffle = True
 
-    train_loader = DataLoader(trainset, num_workers=1, shuffle=shuffle,
+    train_loader = DataLoader(trainset, num_workers=0, shuffle=False,
                               sampler=train_sampler,
                               batch_size=args.batch_size, pin_memory=False,
                               drop_last=True, collate_fn=collate_fn)
@@ -459,8 +471,9 @@ def main():
 
     model.train()
 
-    if args.enable_integration_test:
-        connect(args)
+    if args.enable_modeltests:
+        global reporter
+        reporter = ReportClient(port=args.testserver_port)
 
     for epoch in range(start_epoch, args.epochs):
         torch.cuda.synchronize()
@@ -530,8 +543,14 @@ def main():
 
             DLLogger.log(step=(epoch, i), data={'train_items_per_sec': items_per_sec})
             DLLogger.log(step=(epoch, i), data={'train_iter_time': iter_time})
-            notify(i, reduced_loss, items_per_sec, args)
+
+            if args.enable_modeltests:
+                iters_per_sec = 1/iter_time
+                reporter.report(i, reduced_loss, iters_per_sec, items_per_sec=items_per_sec)
             iteration += 1
+            if iteration == 30:
+                exit(0)
+            DLLogger.flush()
 
         torch.cuda.synchronize()
         epoch_stop_time = time.perf_counter()
